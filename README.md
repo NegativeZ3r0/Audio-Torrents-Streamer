@@ -22,4 +22,6 @@ directly from memory to the system audio output device as pieces arrive.
   ```
 
 ### Demo:
-![recording_20260226_220010.mp4](recording_20261026_220010.mp4)
+https://github.com/user-attachments/assets/b8543108-6306-4d1f-8208-9b0b6bb2010b
+
+
