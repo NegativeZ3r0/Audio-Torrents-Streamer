@@ -60,15 +60,66 @@
 #include <unordered_map>
 #include <vector>
 
+#include <termios.h>
+#include <unistd.h>
+#include <poll.h>
+
 namespace lt = libtorrent;
 
 namespace {
 
 std::atomic<bool> g_interrupted{false};
+std::atomic<bool> g_paused{false};
 
 void signal_handler(int) {
     g_interrupted.store(true);
 }
+
+// RAII helper to put the terminal into non-canonical, no-echo mode so we can
+// detect individual key presses without requiring the user to hit Enter.
+class RawTerminal {
+public:
+    RawTerminal() {
+        if (!::isatty(STDIN_FILENO)) return;
+        if (::tcgetattr(STDIN_FILENO, &m_original) != 0) return;
+        struct termios raw = m_original;
+        raw.c_lflag &= ~static_cast<tcflag_t>(ICANON | ECHO);
+        raw.c_cc[VMIN] = 0;
+        raw.c_cc[VTIME] = 0;
+        if (::tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+            m_active = true;
+        }
+    }
+
+    ~RawTerminal() { restore(); }
+
+    void restore() {
+        if (m_active) {
+            ::tcsetattr(STDIN_FILENO, TCSANOW, &m_original);
+            m_active = false;
+        }
+    }
+
+    bool active() const { return m_active; }
+
+    // Non-blocking check: returns the character if one is available, or -1.
+    static int try_read_char() {
+        struct pollfd pfd{};
+        pfd.fd = STDIN_FILENO;
+        pfd.events = POLLIN;
+        if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+            unsigned char ch = 0;
+            if (::read(STDIN_FILENO, &ch, 1) == 1) {
+                return static_cast<int>(ch);
+            }
+        }
+        return -1;
+    }
+
+private:
+    struct termios m_original{};
+    bool m_active{false};
+};
 
 // Helper for case-insensitive suffix check
 bool ends_with_flac(std::string const& path) {
@@ -629,6 +680,15 @@ static void audio_data_callback(ma_device* pDevice,
         return;
     }
 
+    // When paused, output silence (zeroed buffer) without advancing the decoder
+    if (g_paused.load(std::memory_order_relaxed)) {
+        std::size_t const bytes = static_cast<std::size_t>(frameCount) *
+                                  ma_get_bytes_per_frame(pDevice->playback.format,
+                                                        pDevice->playback.channels);
+        std::memset(pOutput, 0, bytes);
+        return;
+    }
+
     ma_uint64 framesRead = 0;
     ma_result const res =
         ma_decoder_read_pcm_frames(&ctx->decoder, pOutput, frameCount, &framesRead);
@@ -886,11 +946,23 @@ int main(int argc, char* argv[]) {
 
         std::cout << "[+] Streaming FLAC audio ("
                   << audio_ctx.decoder.outputSampleRate << " Hz, "
-                  << audio_ctx.decoder.outputChannels << " ch) — Press Ctrl+C to stop.\n";
+                  << audio_ctx.decoder.outputChannels << " ch)\n"
+                  << "    Controls: [Space] Play/Pause | [Ctrl+C] Stop\n";
+
+        // Put the terminal into raw mode so we can detect key presses instantly
+        RawTerminal raw_term;
 
         // 10. Monitor playback and display real-time streaming telemetry
         while (!audio_ctx.playback_finished.load() && !g_interrupted.load()) {
+            // Check for key input (non-blocking)
+            int const ch = RawTerminal::try_read_char();
+            if (ch == ' ') {
+                bool const was_paused = g_paused.load();
+                g_paused.store(!was_paused);
+            }
+
             lt::torrent_status st = handle.status();
+            bool const paused = g_paused.load();
             double const seconds_played =
                 (audio_ctx.decoder.outputSampleRate > 0)
                     ? static_cast<double>(audio_ctx.frames_played.load()) /
@@ -900,8 +972,11 @@ int main(int argc, char* argv[]) {
             int const mins = static_cast<int>(seconds_played) / 60;
             int const secs = static_cast<int>(seconds_played) % 60;
 
-            std::cout << "\r[>] Playing "
-                      << std::setw(2) << std::setfill('0') << mins << ":"
+            char const* status_icon = paused ? "||" : ">";
+
+            std::cout << "\r[" << status_icon << "] "
+                      << (paused ? "Paused " : "Playing")
+                      << " " << std::setw(2) << std::setfill('0') << mins << ":"
                       << std::setw(2) << std::setfill('0') << secs
                       << " | Stream Pos: " << format_bytes(stream.cursor())
                       << " / " << format_bytes(stream.file_size())
@@ -911,6 +986,9 @@ int main(int argc, char* argv[]) {
 
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
+
+        // Restore terminal before printing final messages
+        raw_term.restore();
 
         std::cout << "\n[+] Playback finished. Cleaning up in-memory buffers...\n";
 
